@@ -63,9 +63,8 @@ const findVal = (row, needle) => {
 };
 
 // BSE F&O (Sensex, Bankex) trades through the same NSE Bhavcopy/SPAN/ELM
-// files rather than a separate BSE file set — so "BFO" is just a symbol
-// filter over the NFO data, not a separate upload.
-const BFO_INDEX_SYMBOLS = ["SENSEX", "BANKEX"];
+// files — so those symbols are just regular NFO symbols, no separate
+// exchange option is needed for them.
 
 // ---- persistence: IndexedDB so uploaded files survive a page refresh ----
 // (this runs in your own browser tab, not inside a Claude.ai preview, so
@@ -464,7 +463,7 @@ function parsePositionsCsv(rows) {
       const strike = instrument === "OPT" && strikeRaw ? String(parseFloat(strikeRaw)) : "";
       const side = qtyRaw >= 0 ? "Buy" : "Sell";
       const qty = Math.abs(qtyRaw);
-      const market = ["BFO", "MCX"].includes(marketRaw) ? marketRaw : "NFO";
+      const market = marketRaw === "MCX" ? "MCX" : marketRaw === "BFO" ? "BFO" : "NFO";
       return { id: crypto.randomUUID(), market, symbol, expiry, instrument, strike, optionType, side, qty };
     })
     .filter(Boolean);
@@ -513,7 +512,7 @@ export default function VasusCalculator() {
   const [csvError, setCsvError] = useState("");
   const [restored, setRestored] = useState(false);
   const [sharedLoading, setSharedLoading] = useState(false);
-  const [sharedSyncStatus, setSharedSyncStatus] = useState({ contracts: null, span: null, elm: null });
+  const [sharedSyncStatus, setSharedSyncStatus] = useState({ contracts: null, span: null, elm: null, elmContracts: null });
   const inputs = {
     contracts: useRef(), span: useRef(), elm: useRef(), elmContracts: useRef(), positions: useRef(),
     mcxContracts: useRef(), mcxSpan: useRef(), mcxMargin: useRef(),
@@ -575,6 +574,13 @@ export default function VasusCalculator() {
           setElmMap(map);
           setFileStatus((s) => ({ ...s, elm: `${Object.keys(map).length} symbols (shared)` }));
         }
+        if (data.elmContracts?.url) {
+          const text = await (await fetch(data.elmContracts.url)).text();
+          const rows = Papa.parse(text, { header: false, skipEmptyLines: true }).data;
+          const map = parseElmContracts(rows);
+          setElmContractMap(map);
+          setFileStatus((s) => ({ ...s, elmContracts: `${Object.keys(map).length} contracts (shared)` }));
+        }
       } catch (e) {
         console.warn("Could not load shared data", e);
       } finally {
@@ -634,7 +640,7 @@ export default function VasusCalculator() {
         }
       },
     });
-    pushToShared(file, kind);
+    pushToShared(file, kind === "contracts" ? "bhavcopy" : kind);
   };
 
   const handleElmContractsUpload = (e) => {
@@ -649,6 +655,7 @@ export default function VasusCalculator() {
         setFileStatus((s) => ({ ...s, elmContracts: `${Object.keys(map).length} contracts` }));
       },
     });
+    pushToShared(file, "elmContracts");
   };
 
   const handleSpanUpload = (e) => {
@@ -725,8 +732,7 @@ export default function VasusCalculator() {
 
   const activeContracts = useMemo(() => {
     if (draft.market === "MCX") return mcxContracts;
-    if (draft.market === "BFO") return contracts.filter((c) => BFO_INDEX_SYMBOLS.includes(c.symbol));
-    return contracts.filter((c) => !BFO_INDEX_SYMBOLS.includes(c.symbol));
+    return contracts;
   }, [draft.market, contracts, mcxContracts]);
   const symbols = useMemo(() => [...new Set(activeContracts.map((c) => c.symbol))].sort(), [activeContracts]);
   const expiries = useMemo(() => (!draft.symbol ? [] : [...new Set(activeContracts.filter((c) => c.symbol === draft.symbol).map((c) => c.expiry))]), [activeContracts, draft.symbol]);
@@ -792,7 +798,7 @@ export default function VasusCalculator() {
         return { ...leg, found: !!c, spanFound, lotSize, price, span, exposure: 0, premium, premiumReceivable, spreadPair: false, total: span + premium };
       }
 
-      // NFO / BFO — same SPAN + ELM data (BFO is a symbol filter, not a separate file set)
+      // NFO — SPAN + ELM data from the Bhavcopy/SPAN/ELM files (Sensex and Bankex trade under NFO too, same data)
       const perUnitRisk = isLongOption ? 0 : scanRisk(spanData, leg);
       const spanFound = isLongOption ? true : perUnitRisk !== null;
       let span = isLongOption ? 0 : (perUnitRisk || 0) * leg.qty;
@@ -814,7 +820,7 @@ export default function VasusCalculator() {
 
     const grossIndependent = built.reduce((s, r) => s + r.span + r.exposure, 0);
 
-    // Portfolio-level SPAN for NFO/BFO. The 16 risk arrays are combined across
+    // Portfolio-level SPAN for NFO. The 16 risk arrays are combined across
     // every expiry of the same underlying. Calendar-spread charge is then added
     // from the portfolio's composite delta by expiry. Net option value is
     // applied once at the portfolio level, so it is never double-counted in the
@@ -945,7 +951,7 @@ export default function VasusCalculator() {
         </div>
 
         <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, color: "var(--text-heading)", marginBottom: 4 }}>NSE F&O</div>
-        <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 12px" }}>This data also covers BFO (Sensex, Bankex) — select BFO as the exchange when adding those positions; no separate upload needed.</p>
+        <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 12px" }}>This data also covers BFO (Sensex, Bankex) — the same symbol list shows under either NFO or BFO, so pick whichever label you want the position tagged with.</p>
         <div style={{ width: "100%", margin: "0 0 26px", display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }} className="vc-grid4">
           <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
             <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>Bhavcopy (contract master)</div>
@@ -995,6 +1001,9 @@ export default function VasusCalculator() {
               <input ref={inputs.elmContracts} type="file" accept=".csv" onChange={handleElmContractsUpload} style={{ display: "none" }} />
             </label>
             {fileStatus.elmContracts && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.elmContracts} loaded</div>}
+            {sharedSyncStatus.elmContracts === "syncing" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>Syncing to shared storage…</div>}
+            {sharedSyncStatus.elmContracts === "synced" && <div style={{ fontSize: 11, color: "var(--green)", marginTop: 4 }}>✓ Visible to all visitors</div>}
+            {sharedSyncStatus.elmContracts === "error" && <div style={{ fontSize: 11, color: "var(--red)", marginTop: 4 }}>Shared sync failed — only saved locally</div>}
           </div>
         </div>
 
@@ -1078,7 +1087,7 @@ export default function VasusCalculator() {
                   downloadCsv(
                     "positions_template.csv",
                     ["Market", "Instrument Type", "Symbol", "Expiry", "Strike", "Option Type", "Qty"],
-                    [["NFO", "FUTSTK", "RELIANCE", "29-SEP-2026", "", "FF", "500"], ["BFO", "FUTIDX", "SENSEX", "29-SEP-2026", "", "FF", "10"], ["MCX", "FUTCOM", "COPPER", "23-SEP-2026", "", "FF", "-1"]]
+                    [["NFO", "FUTSTK", "RELIANCE", "29-SEP-2026", "", "FF", "500"], ["NFO", "FUTIDX", "SENSEX", "29-SEP-2026", "", "FF", "10"], ["MCX", "FUTCOM", "COPPER", "23-SEP-2026", "", "FF", "-1"]]
                   )
                 }
                 style={{ background: "none", border: "none", color: "var(--muted2)", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}
@@ -1105,7 +1114,7 @@ export default function VasusCalculator() {
             <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Exchange</div>
             <select value={draft.market} onChange={(e) => setDraft((d) => ({ ...emptyDraft(), market: e.target.value }))} style={selStyle}>
               <option value="NFO">NFO — NSE F&O</option>
-              <option value="BFO">BFO — BSE F&O (Sensex, Bankex)</option>
+              <option value="BFO">BFO — BSE F&O</option>
               <option value="MCX">MCX — commodities</option>
             </select>
           </div>
