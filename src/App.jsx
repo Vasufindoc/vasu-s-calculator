@@ -1,8 +1,25 @@
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
-import { Plus, Trash2, TrendingUp, ShieldCheck, UploadCloud, CheckCircle2, AlertCircle, Info, Loader2, Settings, ArrowLeft, Download } from "lucide-react";
+import { upload } from "@vercel/blob/client";
+import { Plus, Trash2, TrendingUp, ShieldCheck, UploadCloud, CheckCircle2, AlertCircle, Info, Loader2, Settings, ArrowLeft, Download, Sun, Moon } from "lucide-react";
 
-const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');`;
+const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap');
+#root { max-width: none !important; margin: 0 !important; padding: 0 !important; text-align: left !important; width: 100%; }
+body { margin: 0; }
+[data-theme="dark"] {
+  --bg: #0F1420; --surface: #161D2E; --border: #232C42; --border-light: #2A3450;
+  --text: #E9ECF3; --text-heading: #F4F1EA; --muted: #8992A9; --muted2: #5B6579;
+  --accent: #E8A33D; --accent-text: #161006; --accent-border: #E8A33D40;
+  --green: #3FBF7F; --red: #E5484D; --red-border: #E5484D40;
+  --row-border: #1C2438; --warning-bg: #2A1F12; --benefit-bg: #123024;
+}
+[data-theme="light"] {
+  --bg: #F4F5F8; --surface: #FFFFFF; --border: #E1E4EA; --border-light: #D5D9E0;
+  --text: #1A2233; --text-heading: #0F1420; --muted: #5B6579; --muted2: #8992A9;
+  --accent: #C7780F; --accent-text: #FFFFFF; --accent-border: #C7780F40;
+  --green: #1E9D5C; --red: #D6373D; --red-border: #D6373D40;
+  --row-border: #EDEFF3; --warning-bg: #FDF0DC; --benefit-bg: #E3F6EC;
+}`;
 
 const MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
 const fmtExpiryIso = (iso) => {
@@ -464,13 +481,19 @@ function downloadCsv(filename, headers, sampleRows) {
   URL.revokeObjectURL(url);
 }
 
-const emptyDraft = () => ({ market: "NFO", symbol: "", expiry: "", instrument: "FUT", strike: "", optionType: "CE", side: "Buy", lots: 1 });
-const fileBtnStyle = { display: "flex", alignItems: "center", gap: 8, background: "#0F1420", border: "1px dashed #2A3450", borderRadius: 8, padding: "10px 12px", cursor: "pointer", fontSize: 12.5, color: "#8992A9" };
-const selStyle = { background: "#161D2E", border: "1px solid #2A3450", borderRadius: 6, color: "#E9ECF3", fontSize: 12.5, padding: "7px 8px", outline: "none", width: "100%" };
-const topBtnStyle = { display: "flex", alignItems: "center", gap: 6, background: "#161D2E", border: "1px solid #232C42", borderRadius: 8, padding: "8px 14px", fontSize: 12.5, color: "#E9ECF3", cursor: "pointer" };
+const emptyDraft = () => ({ market: "NFO", symbol: "", expiry: "", instrument: "FUT", strike: "", optionType: "CE", side: "Buy", qty: 0 });
+const fileBtnStyle = { display: "flex", alignItems: "center", gap: 8, background: "var(--bg)", border: "1px dashed var(--border-light)", borderRadius: 8, padding: "10px 12px", cursor: "pointer", fontSize: 12.5, color: "var(--muted)" };
+const selStyle = { background: "var(--surface)", border: "1px solid var(--border-light)", borderRadius: 6, color: "var(--text)", fontSize: 12.5, padding: "7px 8px", outline: "none", width: "100%" };
+const topBtnStyle = { display: "flex", alignItems: "center", gap: 6, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "8px 14px", fontSize: 12.5, color: "var(--text)", cursor: "pointer" };
 
 export default function VasusCalculator() {
   const [view, setView] = useState("calculator");
+  const [theme, setTheme] = useState(() => localStorage.getItem("vc_theme") || "dark");
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    localStorage.setItem("vc_theme", next);
+  };
 
   const [contracts, setContracts] = useState([]);
   const [spanData, setSpanData] = useState({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {} });
@@ -489,6 +512,8 @@ export default function VasusCalculator() {
   const [draft, setDraft] = useState(emptyDraft());
   const [csvError, setCsvError] = useState("");
   const [restored, setRestored] = useState(false);
+  const [sharedLoading, setSharedLoading] = useState(false);
+  const [sharedSyncStatus, setSharedSyncStatus] = useState({ contracts: null, span: null, elm: null });
   const inputs = {
     contracts: useRef(), span: useRef(), elm: useRef(), elmContracts: useRef(), positions: useRef(),
     mcxContracts: useRef(), mcxSpan: useRef(), mcxMargin: useRef(),
@@ -519,6 +544,45 @@ export default function VasusCalculator() {
     })();
   }, []);
 
+  // Shared data: fetched from the backend (Vercel Blob + KV) so whatever any
+  // one person uploads is visible to every visitor automatically — this
+  // overrides the local IndexedDB restore above once it's available, since
+  // the shared copy is the source of truth once someone has uploaded one.
+  useEffect(() => {
+    (async () => {
+      try {
+        setSharedLoading(true);
+        const res = await fetch("/api/files");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.bhavcopy?.url) {
+          const text = await (await fetch(data.bhavcopy.url)).text();
+          const rows = Papa.parse(text, { header: true, skipEmptyLines: true }).data;
+          const parsed = parseBhavcopy(rows);
+          setContracts(parsed);
+          setFileStatus((s) => ({ ...s, contracts: `${parsed.length} contracts (Bhavcopy, shared)` }));
+        }
+        if (data.span?.url) {
+          const text = await (await fetch(data.span.url)).text();
+          const parsed = parseSpanFile(text);
+          setSpanData(parsed);
+          setFileStatus((s) => ({ ...s, span: `${Object.keys(parsed.futures).length} fut + ${Object.keys(parsed.options).length} opt (shared)` }));
+        }
+        if (data.elm?.url) {
+          const text = await (await fetch(data.elm.url)).text();
+          const rows = Papa.parse(text, { header: true, skipEmptyLines: true }).data;
+          const map = parseElm(rows);
+          setElmMap(map);
+          setFileStatus((s) => ({ ...s, elm: `${Object.keys(map).length} symbols (shared)` }));
+        }
+      } catch (e) {
+        console.warn("Could not load shared data", e);
+      } finally {
+        setSharedLoading(false);
+      }
+    })();
+  }, []);
+
   useEffect(() => { if (restored && contracts.length) idbSet("contracts", contracts); }, [restored, contracts]);
   useEffect(() => { if (restored && (Object.keys(spanData.futures).length || Object.keys(spanData.options).length)) idbSet("spanData", spanData); }, [restored, spanData]);
   useEffect(() => { if (restored && Object.keys(elmMap).length) idbSet("elmMap", elmMap); }, [restored, elmMap]);
@@ -536,6 +600,20 @@ export default function VasusCalculator() {
     setFileStatus({ contracts: null, span: null, elm: null, elmContracts: null }); setLegs([]);
     setMcxContracts([]); setMcxSpanData({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {} }); setMcxMarginMap({});
     setMcxFileStatus({ contracts: null, span: null, margin: null });
+  };
+
+  // Pushes the raw file to the shared backend (Vercel Blob) so every visitor
+  // sees it, not just this browser. Fire-and-forget from the UI's point of
+  // view — local parsing/state already happened, this just syncs it out.
+  const pushToShared = async (file, kind) => {
+    setSharedSyncStatus((s) => ({ ...s, [kind]: "syncing" }));
+    try {
+      await upload(file.name, file, { access: "public", handleUploadUrl: "/api/upload", clientPayload: kind });
+      setSharedSyncStatus((s) => ({ ...s, [kind]: "synced" }));
+    } catch (e) {
+      console.warn("Shared sync failed", e);
+      setSharedSyncStatus((s) => ({ ...s, [kind]: "error" }));
+    }
   };
 
   const handleCsvUpload = (kind) => (e) => {
@@ -556,6 +634,7 @@ export default function VasusCalculator() {
         }
       },
     });
+    pushToShared(file, kind);
   };
 
   const handleElmContractsUpload = (e) => {
@@ -586,6 +665,7 @@ export default function VasusCalculator() {
       }, 30);
     };
     reader.readAsText(file);
+    pushToShared(file, "span");
   };
 
   const handleMcxCsvUpload = (kind) => (e) => {
@@ -663,12 +743,24 @@ export default function VasusCalculator() {
     return pool.find((c) => c.symbol === leg.symbol && c.expiry === leg.expiry && c.instrument === leg.instrument && (leg.instrument === "FUT" || (c.strike === leg.strike && c.optionType === leg.optionType)));
   };
 
+  const draftContract = draft.instrument === "FUT" || draft.strike ? matchContract(draft) : null;
+  const draftLotSize = draftContract?.lotSize || 0;
+
+  // once a contract resolves and qty hasn't been touched yet, default to one lot
+  useEffect(() => {
+    if (draftLotSize && !draft.qty) setDraft((d) => ({ ...d, qty: draftLotSize }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftLotSize]);
+
   const addLeg = () => {
     if (!draft.symbol || !draft.expiry) return;
     const c = matchContract(draft);
-    const qty = (c?.lotSize || 0) * Number(draft.lots || 0);
+    const qty = Number(draft.qty || 0);
     setLegs((l) => [...l, { id: crypto.randomUUID(), market: draft.market, symbol: draft.symbol, expiry: draft.expiry, instrument: draft.instrument, strike: draft.strike, optionType: draft.optionType, side: draft.side, qty }]);
-    setDraft((d) => ({ ...emptyDraft(), market: d.market, symbol: d.symbol, expiry: d.expiry }));
+    // keep market/symbol/expiry/instrument/type/side so adding several legs
+    // of the same kind in a row doesn't require reselecting every field —
+    // only strike and qty reset, since those usually change per leg
+    setDraft((d) => ({ ...d, strike: "", qty: 0 }));
   };
   const removeLeg = (id) => setLegs((l) => l.filter((x) => x.id !== id));
   const clearLegs = () => setLegs([]);
@@ -833,103 +925,113 @@ export default function VasusCalculator() {
   // ---------------- Uploader page ----------------
   if (view === "uploader") {
     return (
-      <div style={{ background: "#0F1420", color: "#E9ECF3", fontFamily: "'Inter', sans-serif", minHeight: "100%", padding: "28px 20px" }}>
+      <div data-theme={theme} style={{ background: "var(--bg)", color: "var(--text)", fontFamily: "'Inter', sans-serif", minHeight: "100vh", padding: "28px 20px" }}>
         <style>{FONT_IMPORT}</style>
         <div style={{ width: "100%", margin: "0 0 22px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div>
-            <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 26, margin: 0, color: "#F4F1EA" }}>Data files</h1>
-            <p style={{ margin: "4px 0 0", fontSize: 13, color: "#8992A9" }}>NSE F&O and MCX commodity data — refresh these daily</p>
+            <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 26, margin: 0, color: "var(--text-heading)" }}>Data files</h1>
+            <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--muted)" }}>NSE F&O and MCX commodity data — refresh these daily</p>
           </div>
           <div style={{ display: "flex", gap: 10 }}>
-            <button onClick={clearSavedData} style={{ ...topBtnStyle, color: "#E5484D", borderColor: "#E5484D40" }}><Trash2 size={14} /> Clear saved data</button>
+            <button onClick={toggleTheme} style={topBtnStyle}>{theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}</button>
+            <button onClick={clearSavedData} style={{ ...topBtnStyle, color: "var(--red)", borderColor: "var(--red-border)" }}><Trash2 size={14} /> Clear saved data</button>
             <button onClick={() => setView("calculator")} style={topBtnStyle}><ArrowLeft size={14} /> Calculator</button>
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11.5, color: "#5B6579", margin: "0 0 18px" }}>
-          <CheckCircle2 size={13} color="#3FBF7F" />
+        <div style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11.5, color: "var(--muted2)", margin: "0 0 18px" }}>
+          <CheckCircle2 size={13} color="var(--green)" />
           Files are saved in this browser (IndexedDB) and reload automatically — no need to re-upload after a refresh, until you replace or clear them.
         </div>
 
-        <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, color: "#F4F1EA", marginBottom: 4 }}>NSE F&O</div>
-        <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 12px" }}>This data also covers BFO (Sensex, Bankex) — select BFO as the exchange when adding those positions; no separate upload needed.</p>
+        <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, color: "var(--text-heading)", marginBottom: 4 }}>NSE F&O</div>
+        <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 12px" }}>This data also covers BFO (Sensex, Bankex) — select BFO as the exchange when adding those positions; no separate upload needed.</p>
         <div style={{ width: "100%", margin: "0 0 26px", display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }} className="vc-grid4">
-          <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 10, padding: 16 }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600, color: "#F4F1EA", marginBottom: 8 }}>Bhavcopy (contract master)</div>
-            <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 10px" }}>NSE F&O Bhavcopy CSV — symbol, expiry, strike, lot size, settlement price.</p>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>Bhavcopy (contract master)</div>
+            <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>NSE F&O Bhavcopy CSV — symbol, expiry, strike, lot size, settlement price.</p>
             <label style={fileBtnStyle}>
               <UploadCloud size={15} /><span>{fileStatus.contracts ? "Replace file" : "Upload Bhavcopy CSV"}</span>
               <input ref={inputs.contracts} type="file" accept=".csv" onChange={handleCsvUpload("contracts")} style={{ display: "none" }} />
             </label>
-            {fileStatus.contracts && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3FBF7F", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.contracts} loaded</div>}
+            {fileStatus.contracts && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.contracts} loaded</div>}
+            {sharedSyncStatus.contracts === "syncing" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>Syncing to shared storage…</div>}
+            {sharedSyncStatus.contracts === "synced" && <div style={{ fontSize: 11, color: "var(--green)", marginTop: 4 }}>✓ Visible to all visitors</div>}
+            {sharedSyncStatus.contracts === "error" && <div style={{ fontSize: 11, color: "var(--red)", marginTop: 4 }}>Shared sync failed — only saved locally</div>}
           </div>
 
-          <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 10, padding: 16 }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600, color: "#F4F1EA", marginBottom: 8 }}>SPAN file (.spn)</div>
-            <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 10px" }}>NSCCL SPAN risk file — 16-scenario scan risk, plus calendar spread charge tables.</p>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>SPAN file (.spn)</div>
+            <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>NSCCL SPAN risk file — 16-scenario scan risk, plus calendar spread charge tables.</p>
             <label style={fileBtnStyle}>
               {spanLoading ? <Loader2 size={15} className="vc-spin" /> : <UploadCloud size={15} />}
               <span>{spanLoading ? "Parsing…" : fileStatus.span ? "Replace file" : "Upload .spn file"}</span>
               <input ref={inputs.span} type="file" accept=".spn,.xml,.txt" onChange={handleSpanUpload} style={{ display: "none" }} disabled={spanLoading} />
             </label>
-            {fileStatus.span && !spanLoading && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3FBF7F", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.span} loaded</div>}
+            {fileStatus.span && !spanLoading && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.span} loaded</div>}
+            {sharedSyncStatus.span === "syncing" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>Syncing to shared storage…</div>}
+            {sharedSyncStatus.span === "synced" && <div style={{ fontSize: 11, color: "var(--green)", marginTop: 4 }}>✓ Visible to all visitors</div>}
+            {sharedSyncStatus.span === "error" && <div style={{ fontSize: 11, color: "var(--red)", marginTop: 4 }}>Shared sync failed — only saved locally</div>}
           </div>
 
-          <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 10, padding: 16 }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600, color: "#F4F1EA", marginBottom: 8 }}>ELM file (aggregate)</div>
-            <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 10px" }}>Extreme loss margin % by symbol only — used as a fallback when no contract-level rate is loaded.</p>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>ELM file (aggregate)</div>
+            <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>Extreme loss margin % by symbol only — used as a fallback when no contract-level rate is loaded.</p>
             <label style={fileBtnStyle}>
               <UploadCloud size={15} /><span>{fileStatus.elm ? "Replace file" : "Upload ELM CSV"}</span>
               <input ref={inputs.elm} type="file" accept=".csv" onChange={handleCsvUpload("elm")} style={{ display: "none" }} />
             </label>
-            {fileStatus.elm && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3FBF7F", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.elm} loaded</div>}
+            {fileStatus.elm && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.elm} loaded</div>}
+            {sharedSyncStatus.elm === "syncing" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>Syncing to shared storage…</div>}
+            {sharedSyncStatus.elm === "synced" && <div style={{ fontSize: 11, color: "var(--green)", marginTop: 4 }}>✓ Visible to all visitors</div>}
+            {sharedSyncStatus.elm === "error" && <div style={{ fontSize: 11, color: "var(--red)", marginTop: 4 }}>Shared sync failed — only saved locally</div>}
           </div>
 
-          <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 10, padding: 16 }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600, color: "#F4F1EA", marginBottom: 8 }}>ELM by contract</div>
-            <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 10px" }}>Per symbol+expiry+strike ELM% — more precise than the aggregate file, used first whenever a matching row exists. No header row expected.</p>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>ELM by contract</div>
+            <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>Per symbol+expiry+strike ELM% — more precise than the aggregate file, used first whenever a matching row exists. No header row expected.</p>
             <label style={fileBtnStyle}>
               <UploadCloud size={15} /><span>{fileStatus.elmContracts ? "Replace file" : "Upload contract-level CSV"}</span>
               <input ref={inputs.elmContracts} type="file" accept=".csv" onChange={handleElmContractsUpload} style={{ display: "none" }} />
             </label>
-            {fileStatus.elmContracts && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3FBF7F", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.elmContracts} loaded</div>}
+            {fileStatus.elmContracts && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {fileStatus.elmContracts} loaded</div>}
           </div>
         </div>
 
-        <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, color: "#F4F1EA", marginBottom: 4 }}>Commodities (MCX)</div>
-        <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 12px" }}>
+        <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, color: "var(--text-heading)", marginBottom: 4 }}>Commodities (MCX)</div>
+        <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 12px" }}>
           Futures margin uses MCX's Margin Detail Report percentages directly (Initial + Tender as span, Additional/Special/ELM/Delivery as exposure). Options margin falls back to the .spn scan-risk array, since the margin report doesn't cover options. Calendar spread charges aren't applied for MCX yet — MCX's dSpread tables reference tier numbers rather than exact expiries, and that mapping isn't confirmed.
         </p>
         <div style={{ width: "100%", margin: "0", display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }} className="vc-grid3">
-          <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 10, padding: 16 }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600, color: "#F4F1EA", marginBottom: 8 }}>MCX Bhavcopy (contract master)</div>
-            <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 10px" }}>Lot size is derived from the day's traded volume, so illiquid contracts may show no lot size.</p>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>MCX Bhavcopy (contract master)</div>
+            <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>Lot size is derived from the day's traded volume, so illiquid contracts may show no lot size.</p>
             <label style={fileBtnStyle}>
               <UploadCloud size={15} /><span>{mcxFileStatus.contracts ? "Replace file" : "Upload Bhavcopy CSV"}</span>
               <input ref={inputs.mcxContracts} type="file" accept=".csv" onChange={handleMcxCsvUpload("contracts")} style={{ display: "none" }} />
             </label>
-            {mcxFileStatus.contracts && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3FBF7F", marginTop: 8 }}><CheckCircle2 size={12} /> {mcxFileStatus.contracts} loaded</div>}
+            {mcxFileStatus.contracts && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {mcxFileStatus.contracts} loaded</div>}
           </div>
 
-          <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 10, padding: 16 }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600, color: "#F4F1EA", marginBottom: 8 }}>MCX SPAN file (.spn)</div>
-            <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 10px" }}>Used for options scan risk (margin report doesn't cover options).</p>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>MCX SPAN file (.spn)</div>
+            <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>Used for options scan risk (margin report doesn't cover options).</p>
             <label style={fileBtnStyle}>
               {mcxSpanLoading ? <Loader2 size={15} className="vc-spin" /> : <UploadCloud size={15} />}
               <span>{mcxSpanLoading ? "Parsing…" : mcxFileStatus.span ? "Replace file" : "Upload .spn file"}</span>
               <input ref={inputs.mcxSpan} type="file" accept=".spn,.xml,.txt" onChange={handleMcxSpanUpload} style={{ display: "none" }} disabled={mcxSpanLoading} />
             </label>
-            {mcxFileStatus.span && !mcxSpanLoading && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3FBF7F", marginTop: 8 }}><CheckCircle2 size={12} /> {mcxFileStatus.span} loaded</div>}
+            {mcxFileStatus.span && !mcxSpanLoading && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {mcxFileStatus.span} loaded</div>}
           </div>
 
-          <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 10, padding: 16 }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600, color: "#F4F1EA", marginBottom: 8 }}>Margin detail report</div>
-            <p style={{ fontSize: 12, color: "#5B6579", margin: "0 0 10px" }}>Initial/Tender/Additional/Special/ELM/Delivery % by symbol and expiry — futures only.</p>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>Margin detail report</div>
+            <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>Initial/Tender/Additional/Special/ELM/Delivery % by symbol and expiry — futures only.</p>
             <label style={fileBtnStyle}>
               <UploadCloud size={15} /><span>{mcxFileStatus.margin ? "Replace file" : "Upload margin CSV"}</span>
               <input ref={inputs.mcxMargin} type="file" accept=".csv" onChange={handleMcxCsvUpload("margin")} style={{ display: "none" }} />
             </label>
-            {mcxFileStatus.margin && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3FBF7F", marginTop: 8 }}><CheckCircle2 size={12} /> {mcxFileStatus.margin} loaded</div>}
+            {mcxFileStatus.margin && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {mcxFileStatus.margin} loaded</div>}
           </div>
         </div>
 
@@ -940,28 +1042,37 @@ export default function VasusCalculator() {
 
   // ---------------- Calculator page ----------------
   return (
-    <div style={{ background: "#0F1420", color: "#E9ECF3", fontFamily: "'Inter', sans-serif", minHeight: "100%", padding: "28px 20px" }}>
+    <div data-theme={theme} style={{ background: "var(--bg)", color: "var(--text)", fontFamily: "'Inter', sans-serif", minHeight: "100vh", padding: "28px 20px" }}>
       <style>{FONT_IMPORT}</style>
 
       <div style={{ width: "100%", margin: "0 0 20px", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <div>
-          <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 30, margin: 0, color: "#F4F1EA" }}>Vasu's Calculator</h1>
-          <p style={{ margin: "4px 0 0", fontSize: 13.5, color: "#8992A9" }}>F&O + MCX margin estimator</p>
+          <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 30, margin: 0, color: "var(--text-heading)" }}>Vasu's Calculator</h1>
+          <p style={{ margin: "4px 0 0", fontSize: 13.5, color: "var(--muted)" }}>F&O + MCX margin estimator</p>
         </div>
-        <button onClick={() => setView("uploader")} style={topBtnStyle}><Settings size={14} /> Uploader</button>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={toggleTheme} style={topBtnStyle}>{theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}</button>
+          <button onClick={() => setView("uploader")} style={topBtnStyle}><Settings size={14} /> Uploader</button>
+        </div>
       </div>
 
-      {!anyReady && (
-        <div style={{ width: "100%", margin: "0 0 18px", display: "flex", gap: 8, alignItems: "center", background: "#2A1F12", border: "1px solid #E8A33D40", borderRadius: 8, padding: "10px 14px", fontSize: 12.5, color: "#E8A33D" }}>
+      {sharedLoading && (
+        <div style={{ width: "100%", margin: "0 0 18px", display: "flex", gap: 8, alignItems: "center", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 14px", fontSize: 12.5, color: "var(--muted)" }}>
+          <Loader2 size={14} className="vc-spin" /> Checking for shared data uploaded by others…
+        </div>
+      )}
+
+      {!anyReady && !sharedLoading && (
+        <div style={{ width: "100%", margin: "0 0 18px", display: "flex", gap: 8, alignItems: "center", background: "var(--warning-bg)", border: "1px solid var(--accent-border)", borderRadius: 8, padding: "10px 14px", fontSize: 12.5, color: "var(--accent)" }}>
           <AlertCircle size={14} /> No data loaded yet — open <b style={{ margin: "0 4px" }}>Uploader</b> to add Bhavcopy, SPAN and margin files first.
         </div>
       )}
 
       <div style={{ width: "100%", margin: "0", display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 20 }} className="vc-grid">
-        <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 12, padding: 20 }}>
-          <div style={{ border: "1px solid #232C42", borderRadius: 10, padding: 14, marginBottom: 18 }}>
+        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 12, padding: 20 }}>
+          <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 14, marginBottom: 18 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: "#F4F1EA" }}>Upload positions CSV</span>
+              <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-heading)" }}>Upload positions CSV</span>
               <button
                 onClick={() =>
                   downloadCsv(
@@ -970,7 +1081,7 @@ export default function VasusCalculator() {
                     [["NFO", "FUTSTK", "RELIANCE", "29-SEP-2026", "", "FF", "500"], ["BFO", "FUTIDX", "SENSEX", "29-SEP-2026", "", "FF", "10"], ["MCX", "FUTCOM", "COPPER", "23-SEP-2026", "", "FF", "-1"]]
                   )
                 }
-                style={{ background: "none", border: "none", color: "#5B6579", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}
+                style={{ background: "none", border: "none", color: "var(--muted2)", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}
               >
                 <Download size={12} /> template
               </button>
@@ -979,19 +1090,19 @@ export default function VasusCalculator() {
               <UploadCloud size={15} /><span>Upload positions CSV</span>
               <input ref={inputs.positions} type="file" accept=".csv" onChange={handlePositionsUpload} style={{ display: "none" }} />
             </label>
-            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 11, color: "#5B6579", marginTop: 8 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 11, color: "var(--muted2)", marginTop: 8 }}>
               <Info size={12} style={{ marginTop: 1, flexShrink: 0 }} />
               <span>Columns: Market (NFO/BFO/MCX, defaults to NFO), Instrument Type (FUTSTK/OPTSTK/FUTIDX/OPTIDX for NFO/BFO, FUTCOM/OPTFUT/FUTIDX/OPTIDX for MCX), Symbol, Expiry, Strike (blank for futures), Option Type (FF/CE/PE), Qty. Qty sign sets side: positive = Buy, negative = Sell.</span>
             </div>
-            {csvError && <div style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11.5, color: "#E5484D", marginTop: 8 }}><AlertCircle size={12} /> {csvError}</div>}
+            {csvError && <div style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11.5, color: "var(--red)", marginTop: 8 }}><AlertCircle size={12} /> {csvError}</div>}
           </div>
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-            <h2 style={{ fontSize: 15, fontWeight: 600, margin: 0, color: "#F4F1EA" }}>Add position manually</h2>
+            <h2 style={{ fontSize: 15, fontWeight: 600, margin: 0, color: "var(--text-heading)" }}>Add position manually</h2>
           </div>
 
           <div style={{ marginBottom: 8 }}>
-            <div style={{ fontSize: 11, color: "#5B6579", marginBottom: 4 }}>Exchange</div>
+            <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Exchange</div>
             <select value={draft.market} onChange={(e) => setDraft((d) => ({ ...emptyDraft(), market: e.target.value }))} style={selStyle}>
               <option value="NFO">NFO — NSE F&O</option>
               <option value="BFO">BFO — BSE F&O (Sensex, Bankex)</option>
@@ -1001,14 +1112,14 @@ export default function VasusCalculator() {
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
             <div>
-              <div style={{ fontSize: 11, color: "#5B6579", marginBottom: 4 }}>Symbol</div>
+              <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Symbol</div>
               <select disabled={!ready} value={draft.symbol} onChange={(e) => setDraft((d) => ({ ...d, symbol: e.target.value, expiry: "", strike: "" }))} style={selStyle}>
                 <option value="">Select</option>
                 {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
             <div>
-              <div style={{ fontSize: 11, color: "#5B6579", marginBottom: 4 }}>Expiry</div>
+              <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Expiry</div>
               <select disabled={!draft.symbol} value={draft.expiry} onChange={(e) => setDraft((d) => ({ ...d, expiry: e.target.value }))} style={selStyle}>
                 <option value="">Select</option>
                 {expiries.map((ex) => <option key={ex} value={ex}>{ex}</option>)}
@@ -1018,7 +1129,7 @@ export default function VasusCalculator() {
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 8 }}>
             <div>
-              <div style={{ fontSize: 11, color: "#5B6579", marginBottom: 4 }}>Instrument</div>
+              <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Instrument</div>
               <select value={draft.instrument} onChange={(e) => setDraft((d) => ({ ...d, instrument: e.target.value, strike: "" }))} style={selStyle}>
                 <option value="FUT">Futures</option>
                 <option value="OPT">Options</option>
@@ -1027,14 +1138,14 @@ export default function VasusCalculator() {
             {draft.instrument === "OPT" && (
               <>
                 <div>
-                  <div style={{ fontSize: 11, color: "#5B6579", marginBottom: 4 }}>Type</div>
+                  <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Type</div>
                   <select value={draft.optionType} onChange={(e) => setDraft((d) => ({ ...d, optionType: e.target.value, strike: "" }))} style={selStyle}>
                     <option value="CE">Call</option>
                     <option value="PE">Put</option>
                   </select>
                 </div>
                 <div>
-                  <div style={{ fontSize: 11, color: "#5B6579", marginBottom: 4 }}>Strike</div>
+                  <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Strike</div>
                   <select value={draft.strike} onChange={(e) => setDraft((d) => ({ ...d, strike: e.target.value }))} style={selStyle}>
                     <option value="">Select</option>
                     {strikes.map((s) => <option key={s} value={s}>{s}</option>)}
@@ -1046,27 +1157,44 @@ export default function VasusCalculator() {
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 16 }}>
             <div>
-              <div style={{ fontSize: 11, color: "#5B6579", marginBottom: 4 }}>Side</div>
-              <select value={draft.side} onChange={(e) => setDraft((d) => ({ ...d, side: e.target.value }))} style={{ ...selStyle, color: draft.side === "Buy" ? "#3FBF7F" : "#E5484D", fontWeight: 600 }}>
+              <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Side</div>
+              <select value={draft.side} onChange={(e) => setDraft((d) => ({ ...d, side: e.target.value }))} style={{ ...selStyle, color: draft.side === "Buy" ? "var(--green)" : "var(--red)", fontWeight: 600 }}>
                 <option value="Buy">Buy</option>
                 <option value="Sell">Sell</option>
               </select>
             </div>
             <div>
-              <div style={{ fontSize: 11, color: "#5B6579", marginBottom: 4 }}>Lots</div>
-              <input type="number" min={1} value={draft.lots} onChange={(e) => setDraft((d) => ({ ...d, lots: e.target.value }))} style={{ ...selStyle, fontFamily: "'IBM Plex Mono', monospace" }} />
+              <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>
+                Net Quantity{draftLotSize ? <span style={{ color: "var(--muted2)", fontWeight: 400 }}> (Lot size: {draftLotSize})</span> : null}
+              </div>
+              <input
+                type="number"
+                step={draftLotSize || 1}
+                min={0}
+                value={draft.qty}
+                onChange={(e) => setDraft((d) => ({ ...d, qty: e.target.value }))}
+                onBlur={() => {
+                  if (!draftLotSize) return;
+                  setDraft((d) => {
+                    const raw = Number(d.qty || 0);
+                    const snapped = Math.round(raw / draftLotSize) * draftLotSize;
+                    return { ...d, qty: snapped };
+                  });
+                }}
+                style={{ ...selStyle, fontFamily: "'IBM Plex Mono', monospace" }}
+              />
             </div>
             <div style={{ display: "flex", alignItems: "flex-end" }}>
-              <button onClick={addLeg} disabled={!draft.symbol || !draft.expiry} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, background: "#E8A33D", color: "#161006", border: "none", borderRadius: 7, padding: "8px 12px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+              <button onClick={addLeg} disabled={!draft.symbol || !draft.expiry} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, background: "var(--accent)", color: "var(--accent-text)", border: "none", borderRadius: 7, padding: "8px 12px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
                 <Plus size={14} /> Add
               </button>
             </div>
           </div>
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-            <h2 style={{ fontSize: 15, fontWeight: 600, margin: 0, color: "#F4F1EA" }}>Positions — margin by symbol</h2>
+            <h2 style={{ fontSize: 15, fontWeight: 600, margin: 0, color: "var(--text-heading)" }}>Positions — margin by symbol</h2>
             {legs.length > 0 && (
-              <button onClick={clearLegs} style={{ display: "flex", alignItems: "center", gap: 6, background: "#161D2E", border: "1px solid #E5484D40", borderRadius: 7, padding: "6px 12px", fontSize: 12, color: "#E5484D", cursor: "pointer" }}>
+              <button onClick={clearLegs} style={{ display: "flex", alignItems: "center", gap: 6, background: "var(--surface)", border: "1px solid var(--red-border)", borderRadius: 7, padding: "6px 12px", fontSize: 12, color: "var(--red)", cursor: "pointer" }}>
                 <Trash2 size={13} /> Reset positions
               </button>
             )}
@@ -1074,9 +1202,9 @@ export default function VasusCalculator() {
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5, minWidth: 720 }}>
               <thead>
-                <tr style={{ color: "#5B6579", textAlign: "left" }}>
+                <tr style={{ color: "var(--muted2)", textAlign: "left" }}>
                   {["Market", "Contract", "Expiry", "Side", "Qty", "Span", "Exposure", "Premium", "Total (incl. premium)", ""].map((h) => (
-                    <th key={h} style={{ padding: "6px 7px", fontWeight: 500, borderBottom: "1px solid #232C42" }}>{h}</th>
+                    <th key={h} style={{ padding: "10px 8px", fontWeight: 500, borderBottom: "1px solid var(--border)" }}>{h}</th>
                   ))}
                 </tr>
               </thead>
@@ -1084,67 +1212,68 @@ export default function VasusCalculator() {
                 {rows.grouped.map((g) => (
                   <>
                     {g.legs.map((r) => (
-                      <tr key={r.id} style={{ borderBottom: "1px solid #1C2438" }}>
-                        <td style={{ padding: "7px", color: "#8992A9" }}>{r.market}</td>
-                        <td style={{ padding: "7px" }}>
+                      <tr key={r.id} style={{ borderBottom: "1px solid var(--row-border)" }}>
+                        <td style={{ padding: "12px 8px", color: "var(--muted)" }}>{r.market}</td>
+                        <td style={{ padding: "12px 8px" }}>
                           {r.symbol}{r.instrument === "OPT" ? ` ${r.strike}${r.optionType}` : " FUT"}
-                          {!r.found && <span style={{ color: "#E5484D", marginLeft: 6, fontFamily: "'Inter', sans-serif" }}>no contract match</span>}
-                          {r.found && !r.spanFound && <span style={{ color: "#E8A33D", marginLeft: 6, fontFamily: "'Inter', sans-serif" }}>no margin data</span>}
-                          {r.calendarSpread && <span style={{ color: "#E8A33D", marginLeft: 6, fontFamily: "'Inter', sans-serif" }}>calendar</span>}
-                          {r.comboGroup && <span style={{ color: "#E8A33D", marginLeft: 6, fontFamily: "'Inter', sans-serif" }}>combo</span>}
+                          {!r.found && <span style={{ color: "var(--red)", marginLeft: 6, fontFamily: "'Inter', sans-serif" }}>no contract match</span>}
+                          {r.found && !r.spanFound && <span style={{ color: "var(--accent)", marginLeft: 6, fontFamily: "'Inter', sans-serif" }}>no margin data</span>}
+                          {r.calendarSpread && <span style={{ color: "var(--accent)", marginLeft: 6, fontFamily: "'Inter', sans-serif" }}>calendar</span>}
+                          {r.comboGroup && <span style={{ color: "var(--accent)", marginLeft: 6, fontFamily: "'Inter', sans-serif" }}>combo</span>}
                         </td>
-                        <td style={{ padding: "7px", color: "#8992A9" }}>{r.expiry}</td>
-                        <td style={{ padding: "7px", color: r.side === "Buy" ? "#3FBF7F" : "#E5484D" }}>{r.side}</td>
-                        <td style={{ padding: "7px" }}>{r.qty}</td>
-                        <td style={{ padding: "7px" }}>{fmt(r.span)}</td>
-                        <td style={{ padding: "7px" }}>{fmt(r.exposure)}</td>
-                        <td style={{ padding: "7px", color: "#8992A9" }}>{r.premium ? fmt(r.premium) : "—"}</td>
-                        <td style={{ padding: "7px" }}>{fmt(r.total)}</td>
-                        <td style={{ padding: "7px" }}>
-                          <button onClick={() => removeLeg(r.id)} style={{ background: "none", border: "none", color: "#5B6579", cursor: "pointer" }}><Trash2 size={13} /></button>
+                        <td style={{ padding: "12px 8px", color: "var(--muted)" }}>{r.expiry}</td>
+                        <td style={{ padding: "12px 8px", color: r.side === "Buy" ? "var(--green)" : "var(--red)" }}>{r.side}</td>
+                        <td style={{ padding: "12px 8px" }}>{r.qty}</td>
+                        <td style={{ padding: "12px 8px" }}>{fmt(r.span)}</td>
+                        <td style={{ padding: "12px 8px" }}>{fmt(r.exposure)}</td>
+                        <td style={{ padding: "12px 8px", color: "var(--muted)" }}>{r.premium ? fmt(r.premium) : "—"}</td>
+                        <td style={{ padding: "12px 8px" }}>{fmt(r.total)}</td>
+                        <td style={{ padding: "12px 8px" }}>
+                          <button onClick={() => removeLeg(r.id)} style={{ background: "none", border: "none", color: "var(--muted2)", cursor: "pointer" }}><Trash2 size={13} /></button>
                         </td>
                       </tr>
                     ))}
-                    <tr style={{ borderBottom: "1px solid #232C42", background: "#0F1420" }}>
-                      <td colSpan={5} style={{ padding: "7px", fontFamily: "'Inter', sans-serif", fontWeight: 600, color: "#F4F1EA" }}>
-                        {g.summary.symbol} subtotal {g.summary.hasSpread && <span style={{ color: "#E8A33D", fontWeight: 400 }}>(calendar spread applied)</span>}
+                    <tr style={{ borderBottom: "1px solid var(--border)", background: "var(--bg)" }}>
+                      <td colSpan={5} style={{ padding: "12px 8px", fontFamily: "'Inter', sans-serif", fontWeight: 600, color: "var(--text-heading)" }}>
+                        {g.summary.symbol} subtotal {g.summary.hasSpread && <span style={{ color: "var(--accent)", fontWeight: 400 }}>(calendar spread applied)</span>}
                       </td>
-                      <td style={{ padding: "7px", color: "#E9ECF3" }}>{fmt(g.summary.span)}</td>
-                      <td style={{ padding: "7px", color: "#E9ECF3" }}>{fmt(g.summary.exposure)}</td>
-                      <td style={{ padding: "7px", color: "#8992A9" }}>{g.summary.premium ? fmt(g.summary.premium) : "—"}</td>
-                      <td style={{ padding: "7px", color: "#E8A33D", fontWeight: 600 }}>{fmt(g.summary.total)}</td>
+                      <td style={{ padding: "12px 8px", color: "var(--text)" }}>{fmt(g.summary.span)}</td>
+                      <td style={{ padding: "12px 8px", color: "var(--text)" }}>{fmt(g.summary.exposure)}</td>
+                      <td style={{ padding: "12px 8px", color: "var(--muted)" }}>{g.summary.premium ? fmt(g.summary.premium) : "—"}</td>
+                      <td style={{ padding: "12px 8px", color: "var(--accent)", fontWeight: 600 }}>{fmt(g.summary.total)}</td>
                       <td></td>
                     </tr>
+                    <tr aria-hidden="true"><td colSpan={10} style={{ height: 14, padding: 0, border: "none" }}></td></tr>
                   </>
                 ))}
                 {rows.grouped.length === 0 && (
-                  <tr><td colSpan={10} style={{ padding: "14px 7px", color: "#5B6579", fontFamily: "'Inter', sans-serif" }}>No positions added yet.</td></tr>
+                  <tr><td colSpan={10} style={{ padding: "14px 8px", color: "var(--muted2)", fontFamily: "'Inter', sans-serif" }}>No positions added yet.</td></tr>
                 )}
               </tbody>
             </table>
           </div>
         </div>
 
-        <div style={{ background: "#161D2E", border: "1px solid #232C42", borderRadius: 12, padding: 20, height: "fit-content" }}>
-          <h2 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 14px", color: "#F4F1EA" }}>Margin required</h2>
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#E9ECF3", marginBottom: 6 }}><span>Span margin</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.spanTotal)}</span></div>
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#E9ECF3", marginBottom: 6 }}><span>Exposure margin</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.exposureTotal)}</span></div>
+        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 12, padding: 20, height: "fit-content" }}>
+          <h2 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 14px", color: "var(--text-heading)" }}>Margin required</h2>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "var(--text)", marginBottom: 6 }}><span>Span margin</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.spanTotal)}</span></div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "var(--text)", marginBottom: 6 }}><span>Exposure margin</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.exposureTotal)}</span></div>
           {rows.marginBenefit > 0 && (
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#3FBF7F", marginBottom: 6, background: "#123024", borderRadius: 6, padding: "4px 8px", margin: "0 -8px 6px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "var(--green)", marginBottom: 6, background: "var(--benefit-bg)", borderRadius: 6, padding: "4px 8px", margin: "0 -8px 6px" }}>
               <span>Margin benefit</span><span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>{fmt(rows.marginBenefit)}</span>
             </div>
           )}
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#8992A9", marginBottom: 12 }}><span>Option premium payable</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.premiumTotal)}</span></div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "var(--muted)", marginBottom: 12 }}><span>Option premium payable</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.premiumTotal)}</span></div>
           {rows.premiumReceivableTotal > 0 && (
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#8992A9", marginBottom: 12 }}><span>Premium receivable</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.premiumReceivableTotal)}</span></div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "var(--muted)", marginBottom: 12 }}><span>Premium receivable</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.premiumReceivableTotal)}</span></div>
           )}
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#F4F1EA", fontWeight: 600, marginBottom: 12, borderTop: "1px solid #232C42", paddingTop: 10 }}><span>Total margin</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.net)}</span></div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "var(--text-heading)", fontWeight: 600, marginBottom: 12, borderTop: "1px solid var(--border)", paddingTop: 10 }}><span>Total margin</span><span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(rows.net)}</span></div>
 
-          <div style={{ background: "#0F1420", border: "1px solid #E8A33D40", borderRadius: 10, padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}><TrendingUp size={16} color="#E8A33D" /><span style={{ fontSize: 13, color: "#F4F1EA" }}>Net required</span></div>
-            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 18, fontWeight: 600, color: "#E8A33D" }}>{fmt(rows.net)}</span>
+          <div style={{ background: "var(--bg)", border: "1px solid var(--accent-border)", borderRadius: 10, padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}><TrendingUp size={16} color="var(--accent)" /><span style={{ fontSize: 13, color: "var(--text-heading)" }}>Net required</span></div>
+            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 18, fontWeight: 600, color: "var(--accent)" }}>{fmt(rows.net)}</span>
           </div>
-          <div style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 11.5, color: "#5B6579", marginTop: 14 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 11.5, color: "var(--muted2)", marginTop: 14 }}>
             <ShieldCheck size={13} style={{ marginTop: 1, flexShrink: 0 }} />
             <span>Span combines the real 16-scenario risk arrays for all legs of the same underlying, then applies the uploaded SPAN calendar-spread charge to matched composite delta by expiry and deducts net option value. No broker-specific constants are used. Exposure remains separate.</span>
           </div>
