@@ -16,7 +16,7 @@ body { margin: 0; }
 [data-theme="light"] {
   --bg: #F4F5F8; --surface: #FFFFFF; --border: #E1E4EA; --border-light: #D5D9E0;
   --text: #1A2233; --text-heading: #0F1420; --muted: #5B6579; --muted2: #8992A9;
-  --accent: #C7780F; --accent-text: #FFFFFF; --accent-border: #C7780F40;
+  --accent: #E4711E; --accent-text: #FFFFFF; --accent-border: #E4711E40;
   --green: #1E9D5C; --red: #D6373D; --red-border: #D6373D40;
   --row-border: #EDEFF3; --warning-bg: #FDF0DC; --benefit-bg: #E3F6EC;
 }`;
@@ -921,7 +921,20 @@ export default function VasusCalculator() {
     built.forEach((r) => { const key = `${r.market}:${r.symbol}`; if (!order.includes(key)) order.push(key); });
     const grouped = order.map((key) => ({ key, legs: built.filter((r) => `${r.market}:${r.symbol}` === key), summary: bySymbol[key] }));
 
-    return { grouped, spanTotal, exposureTotal, marginBenefit, premiumTotal, premiumReceivableTotal, net };
+    // One row per real underlying (combining across exchange labels, e.g. a
+    // symbol appearing under both NFO and BFO), using the same post-benefit
+    // span/exposure already computed above — so this table's totals sum to
+    // exactly the same "Total margin required" figure shown in the panel.
+    const byUnderlying = {};
+    const underlyingOrder = [];
+    Object.values(bySymbol).forEach((g) => {
+      if (!byUnderlying[g.symbol]) { byUnderlying[g.symbol] = { underlying: g.symbol, span: 0, exposure: 0 }; underlyingOrder.push(g.symbol); }
+      byUnderlying[g.symbol].span += g.span;
+      byUnderlying[g.symbol].exposure += g.exposure;
+    });
+    const underlyingSummary = underlyingOrder.map((sym) => ({ ...byUnderlying[sym], total: byUnderlying[sym].span + byUnderlying[sym].exposure }));
+
+    return { grouped, spanTotal, exposureTotal, marginBenefit, premiumTotal, premiumReceivableTotal, net, underlyingSummary };
   }, [legs, contracts, spanData, elmMap, elmContractMap, mcxContracts, mcxSpanData, mcxMarginMap]);
 
   const fmt = (n) => "₹" + Math.round(n || 0).toLocaleString("en-IN");
@@ -1055,9 +1068,15 @@ export default function VasusCalculator() {
       <style>{FONT_IMPORT}</style>
 
       <div style={{ width: "100%", margin: "0 0 20px", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div>
-          <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 30, margin: 0, color: "var(--text-heading)" }}>Vasu's Calculator</h1>
-          <p style={{ margin: "4px 0 0", fontSize: 13.5, color: "var(--muted)" }}>F&O + MCX margin estimator</p>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <svg width="40" height="40" viewBox="0 0 40 40" style={{ flexShrink: 0 }}>
+            <rect x="0" y="0" width="40" height="40" rx="10" fill="var(--accent)" />
+            <path d="M12 10 H28 V16 H18 V18 H26 V24 H18 V30 H12 Z" fill="var(--accent-text)" />
+          </svg>
+          <div>
+            <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 30, margin: 0, color: "var(--text-heading)" }}>Findoc</h1>
+            <p style={{ margin: "4px 0 0", fontSize: 13.5, color: "var(--muted)" }}>Margin Calculator</p>
+          </div>
         </div>
         <div style={{ display: "flex", gap: 10 }}>
           <button onClick={toggleTheme} style={topBtnStyle}>{theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}</button>
@@ -1288,6 +1307,54 @@ export default function VasusCalculator() {
           </div>
         </div>
       </div>
+
+      {rows.underlyingSummary.length > 0 && (
+        <div style={{ width: "100%", margin: "20px 0 0", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 12, padding: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <h2 style={{ fontSize: 15, fontWeight: 600, margin: 0, color: "var(--text-heading)" }}>Margin by underlying</h2>
+            <button
+              onClick={() =>
+                downloadCsv(
+                  "margin_by_underlying.csv",
+                  ["Underlying", "Span", "ELM", "Total Margin"],
+                  rows.underlyingSummary.map((u) => [u.underlying, Math.round(u.span), Math.round(u.exposure), Math.round(u.total)])
+                )
+              }
+              style={{ display: "flex", alignItems: "center", gap: 6, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 7, padding: "6px 12px", fontSize: 12, color: "var(--muted)", cursor: "pointer" }}
+            >
+              <Download size={13} /> Export CSV
+            </button>
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+              <thead>
+                <tr style={{ color: "var(--muted)", textAlign: "left" }}>
+                  {["Underlying", "Span", "ELM", "Total Margin"].map((h) => (
+                    <th key={h} style={{ padding: "8px 10px", fontWeight: 500, borderBottom: "1px solid var(--border)" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+                {rows.underlyingSummary.map((u) => (
+                  <tr key={u.underlying} style={{ borderBottom: "1px solid var(--row-border)" }}>
+                    <td style={{ padding: "10px", fontFamily: "'Inter', sans-serif", color: "var(--text-heading)" }}>{u.underlying}</td>
+                    <td style={{ padding: "10px" }}>{fmt(u.span)}</td>
+                    <td style={{ padding: "10px" }}>{fmt(u.exposure)}</td>
+                    <td style={{ padding: "10px", color: "var(--accent)", fontWeight: 600 }}>{fmt(u.total)}</td>
+                  </tr>
+                ))}
+                <tr style={{ background: "var(--bg)" }}>
+                  <td style={{ padding: "10px", fontFamily: "'Inter', sans-serif", fontWeight: 600, color: "var(--text-heading)" }}>Total</td>
+                  <td style={{ padding: "10px", fontWeight: 600 }}>{fmt(rows.spanTotal)}</td>
+                  <td style={{ padding: "10px", fontWeight: 600 }}>{fmt(rows.exposureTotal)}</td>
+                  <td style={{ padding: "10px", color: "var(--accent)", fontWeight: 600 }}>{fmt(rows.net)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div style={{ fontSize: 11, color: "var(--muted2)", marginTop: 10 }}>The Total row above matches "Total margin required" exactly — these are the same post-benefit figures, just grouped by underlying instead of by position.</div>
+        </div>
+      )}
 
       <style>{`
         @media (max-width: 760px) { .vc-grid { grid-template-columns: 1fr !important; } }
