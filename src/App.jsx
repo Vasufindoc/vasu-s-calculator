@@ -181,6 +181,31 @@ function getContractElmPct(map, leg) {
   return map[key];
 }
 
+// BSE contract-specification file (no header row) — supplies BFO contracts
+// (Sensex, Bankex) that NSE's Bhavcopy never includes, since those trade on
+// BSE. Column positions confirmed against real data: field 3 = instrument
+// type (SF/SO = stock fut/opt, IF/IO = index fut/opt), field 5 = symbol,
+// field 7 = expiry, field 8 = strike×100 (0 for futures), field 9 = option
+// type, field 31 = lot size. This file has no settlement/underlying price —
+// that's backfilled separately from the .spn file's live spot price.
+function parseBseContractMaster(rows) {
+  return rows
+    .map((r) => {
+      if (!Array.isArray(r) || r.length < 31) return null;
+      const instrTypeRaw = (r[2] || "").toUpperCase().trim();
+      const symbol = (r[4] || "").toUpperCase().trim();
+      const expiryRaw = r[6] || "";
+      const strikeRaw = r[7];
+      const optionType = (r[8] || "").toUpperCase().trim();
+      const lotSize = Number(r[30] || 0);
+      if (!symbol || !expiryRaw || !instrTypeRaw) return null;
+      const instrument = instrTypeRaw.endsWith("F") ? "FUT" : "OPT";
+      const strike = instrument === "OPT" && strikeRaw ? String(parseFloat(strikeRaw) / 100) : "";
+      return { symbol, expiry: normalizeExpiry(expiryRaw), instrument, strike, optionType: instrument === "OPT" ? optionType : "", lotSize };
+    })
+    .filter(Boolean);
+}
+
 // =====================================================================
 // .spn SPAN file — shared by NSE and MCX (same PC-SPAN 4.00 XML format)
 // =====================================================================
@@ -198,6 +223,7 @@ function parseSpanFile(text) {
   const options = {};
   const spreads = {};
   const deltas = {};
+  const underlyingPrices = {}; // symbol -> live spot/underlying price, from the <phyPf><phy><p> block
 
   const readArray = (block) => {
     const raMatch = block.match(/<ra>[\s\S]*?<\/ra>/);
@@ -205,6 +231,18 @@ function parseSpanFile(text) {
     const vals = [...raMatch[0].matchAll(/<a>(-?[\d.]+)<\/a>/g)].map((m) => parseFloat(m[1]));
     return vals.length >= 16 ? vals : null;
   };
+
+  const phyBlocks = text.split("<phyPf>").slice(1);
+  for (const raw of phyBlocks) {
+    const chunk = raw.slice(0, 2000); // the phy block itself is short, no need to scan the whole rest of the file
+    const code = chunk.match(/<pfCode>([^<]+)<\/pfCode>/);
+    const price = chunk.match(/<p>([^<]+)<\/p>/);
+    if (code && price) {
+      const symbol = code[1].trim().toUpperCase();
+      const p = parseFloat(price[1]);
+      if (p > 0 && !underlyingPrices[symbol]) underlyingPrices[symbol] = p;
+    }
+  }
 
   const futBlocks = text.split("<futPf>").slice(1);
   for (const raw of futBlocks) {
@@ -260,6 +298,7 @@ function parseSpanFile(text) {
 
   const ccBlocks = text.split("<ccDef>").slice(1);
   const somRates = {}; // symbol -> ₹ per short-option-lot floor charge
+  const tierSpreads = {}; // symbol|tierNumber -> ₹ per unit spread charge (MCX-style, tier-based)
   for (const raw of ccBlocks) {
     const block = raw.split("</ccDef>")[0];
     const ccMatch = block.match(/<cc>([^<]+)<\/cc>/);
@@ -270,13 +309,20 @@ function parseSpanFile(text) {
       const sb = sraw.split("</dSpread>")[0];
       const rateMatch = sb.match(/<val>([\d.]+)<\/val>/);
       const peMatches = [...sb.matchAll(/<pe>(\d{8})<\/pe>/g)].map((m) => m[1]);
-      if (!rateMatch || peMatches.length < 2) continue; // skips MCX's tier-based dSpreads
-      const [peA, peB] = peMatches;
-      const expA = fmtExpiryYyyymmdd(peA);
-      const expB = fmtExpiryYyyymmdd(peB);
-      const rate = parseFloat(rateMatch[1]);
-      spreads[`${symbol}|${expA}|${expB}`] = rate;
-      spreads[`${symbol}|${expB}|${expA}`] = rate;
+      if (rateMatch && peMatches.length >= 2) {
+        const [peA, peB] = peMatches;
+        const expA = fmtExpiryYyyymmdd(peA);
+        const expB = fmtExpiryYyyymmdd(peB);
+        const rate = parseFloat(rateMatch[1]);
+        spreads[`${symbol}|${expA}|${expB}`] = rate;
+        spreads[`${symbol}|${expB}|${expA}`] = rate;
+      } else if (rateMatch) {
+        // MCX-style: legs reference a tier number instead of an exact expiry
+        const tnMatches = [...sb.matchAll(/<tLeg>[\s\S]*?<tn>(\d+)<\/tn>[\s\S]*?<\/tLeg>/g)].map((m) => m[1]);
+        if (tnMatches.length >= 2 && tnMatches[0] === tnMatches[1]) {
+          tierSpreads[`${symbol}|${tnMatches[0]}`] = parseFloat(rateMatch[1]);
+        }
+      }
     }
     // Short Option Minimum: a per-lot floor charge on short options, layered
     // on top of scan risk when the scan risk alone comes out too low. Real
@@ -287,7 +333,7 @@ function parseSpanFile(text) {
     if (somMatch) somRates[symbol] = parseFloat(somMatch[1]);
   }
 
-  return { futures, options, spreads, somRates, deltas };
+  return { futures, options, spreads, somRates, deltas, underlyingPrices, tierSpreads };
 }
 
 function getArray(spanData, leg) {
@@ -306,6 +352,34 @@ function getCompositeDelta(spanData, leg) {
 // matched amount is the smaller absolute delta, and the dSpread table supplies
 // the charge per matched delta. This deliberately uses the uploaded SPAN data
 // only — no broker/file-specific constants.
+// Resolves a calendar-spread rate between two expiries of the same symbol.
+// NFO/BFO store rates keyed by exact expiry pair (spanData.spreads). MCX's
+// .spn file instead keys rates by *tier number* — a documented SPAN
+// convention where each tier represents one adjacent-month gap (tier 1 =
+// nearest-to-next-nearest expiry, tier 2 = next pair, and so on). We derive
+// the tier number from the ordinal position of the two expiries among all
+// of that symbol's known futures expiries, and only resolve it when the
+// two legs are genuinely adjacent months — MCX's tier system isn't
+// documented well enough to be confident about non-adjacent combinations,
+// so those fall back to full independent margin instead of guessing.
+function getSpreadRate(spanData, symbol, expA, expB) {
+  const direct = spanData.spreads?.[`${symbol}|${expA}|${expB}`];
+  if (direct !== undefined) return direct;
+  if (spanData.tierSpreads && Object.keys(spanData.tierSpreads).length) {
+    const allExpiries = [...new Set(Object.keys(spanData.futures || {}).filter((k) => k.startsWith(`${symbol}|`)).map((k) => k.split("|")[1]))].sort(
+      (a, b) => parseExpiryDate(a) - parseExpiryDate(b)
+    );
+    const idxA = allExpiries.indexOf(expA);
+    const idxB = allExpiries.indexOf(expB);
+    if (idxA === -1 || idxB === -1) return undefined;
+    const nearIdx = Math.min(idxA, idxB);
+    const farIdx = Math.max(idxA, idxB);
+    if (farIdx - nearIdx !== 1) return undefined; // only adjacent months map to a single tier cleanly
+    return spanData.tierSpreads[`${symbol}|${nearIdx + 1}`];
+  }
+  return undefined;
+}
+
 function calculateCalendarSpreadCharge(groupRows, spanData) {
   const byExpiry = {};
   groupRows.forEach((r) => {
@@ -331,7 +405,7 @@ function calculateCalendarSpreadCharge(groupRows, spanData) {
       const b = work[j];
       if (!a.delta || !b.delta || Math.sign(a.delta) === Math.sign(b.delta)) continue;
 
-      const rate = spanData.spreads?.[`${groupRows[0].symbol}|${a.expiry}|${b.expiry}`];
+      const rate = getSpreadRate(spanData, groupRows[0].symbol, a.expiry, b.expiry);
       if (rate === undefined) continue;
 
       const matchedDelta = Math.min(Math.abs(a.delta), Math.abs(b.delta));
@@ -495,14 +569,16 @@ export default function VasusCalculator() {
   };
 
   const [contracts, setContracts] = useState([]);
-  const [spanData, setSpanData] = useState({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {} });
+  const [bseContracts, setBseContracts] = useState([]);
+  const [bseFileStatus, setBseFileStatus] = useState(null);
+  const [spanData, setSpanData] = useState({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {}, underlyingPrices: {}, tierSpreads: {} });
   const [elmMap, setElmMap] = useState({});
   const [elmContractMap, setElmContractMap] = useState({});
   const [fileStatus, setFileStatus] = useState({ contracts: null, span: null, elm: null, elmContracts: null });
   const [spanLoading, setSpanLoading] = useState(false);
 
   const [mcxContracts, setMcxContracts] = useState([]);
-  const [mcxSpanData, setMcxSpanData] = useState({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {} });
+  const [mcxSpanData, setMcxSpanData] = useState({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {}, underlyingPrices: {}, tierSpreads: {} });
   const [mcxMarginMap, setMcxMarginMap] = useState({});
   const [mcxFileStatus, setMcxFileStatus] = useState({ contracts: null, span: null, margin: null });
   const [mcxSpanLoading, setMcxSpanLoading] = useState(false);
@@ -514,16 +590,17 @@ export default function VasusCalculator() {
   const [sharedLoading, setSharedLoading] = useState(false);
   const [sharedSyncStatus, setSharedSyncStatus] = useState({ contracts: null, span: null, elm: null, elmContracts: null });
   const inputs = {
-    contracts: useRef(), span: useRef(), elm: useRef(), elmContracts: useRef(), positions: useRef(),
+    contracts: useRef(), span: useRef(), elm: useRef(), elmContracts: useRef(), positions: useRef(), bseContracts: useRef(),
     mcxContracts: useRef(), mcxSpan: useRef(), mcxMargin: useRef(),
   };
 
   useEffect(() => {
     (async () => {
       try {
-        const [c, sd, el, ec, fs, lg, mc, msd, mm, mfs] = await Promise.all([
+        const [c, sd, el, ec, fs, lg, mc, msd, mm, mfs, bc, bfs] = await Promise.all([
           idbGet("contracts"), idbGet("spanData"), idbGet("elmMap"), idbGet("elmContractMap"), idbGet("fileStatus"), idbGet("legs"),
           idbGet("mcxContracts"), idbGet("mcxSpanData"), idbGet("mcxMarginMap"), idbGet("mcxFileStatus"),
+          idbGet("bseContracts"), idbGet("bseFileStatus"),
         ]);
         if (c) setContracts(c);
         if (sd) setSpanData(sd);
@@ -535,6 +612,8 @@ export default function VasusCalculator() {
         if (msd) setMcxSpanData(msd);
         if (mm) setMcxMarginMap(mm);
         if (mfs) setMcxFileStatus(mfs);
+        if (bc) setBseContracts(bc);
+        if (bfs) setBseFileStatus(bfs);
       } catch (e) {
         console.warn("Could not restore saved data", e);
       } finally {
@@ -593,6 +672,8 @@ export default function VasusCalculator() {
   useEffect(() => { if (restored && (Object.keys(spanData.futures).length || Object.keys(spanData.options).length)) idbSet("spanData", spanData); }, [restored, spanData]);
   useEffect(() => { if (restored && Object.keys(elmMap).length) idbSet("elmMap", elmMap); }, [restored, elmMap]);
   useEffect(() => { if (restored && Object.keys(elmContractMap).length) idbSet("elmContractMap", elmContractMap); }, [restored, elmContractMap]);
+  useEffect(() => { if (restored && bseContracts.length) idbSet("bseContracts", bseContracts); }, [restored, bseContracts]);
+  useEffect(() => { if (restored && bseFileStatus) idbSet("bseFileStatus", bseFileStatus); }, [restored, bseFileStatus]);
   useEffect(() => { if (restored) idbSet("fileStatus", fileStatus); }, [restored, fileStatus]);
   useEffect(() => { if (restored) idbSet("legs", legs); }, [restored, legs]);
   useEffect(() => { if (restored && mcxContracts.length) idbSet("mcxContracts", mcxContracts); }, [restored, mcxContracts]);
@@ -602,10 +683,11 @@ export default function VasusCalculator() {
 
   const clearSavedData = async () => {
     await idbClearAll();
-    setContracts([]); setSpanData({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {} }); setElmMap({}); setElmContractMap({});
+    setContracts([]); setSpanData({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {}, underlyingPrices: {}, tierSpreads: {} }); setElmMap({}); setElmContractMap({});
     setFileStatus({ contracts: null, span: null, elm: null, elmContracts: null }); setLegs([]);
-    setMcxContracts([]); setMcxSpanData({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {} }); setMcxMarginMap({});
+    setMcxContracts([]); setMcxSpanData({ futures: {}, options: {}, spreads: {}, somRates: {}, deltas: {}, underlyingPrices: {}, tierSpreads: {} }); setMcxMarginMap({});
     setMcxFileStatus({ contracts: null, span: null, margin: null });
+    setBseContracts([]); setBseFileStatus(null);
   };
 
   // Pushes the raw file to the shared backend (Vercel Blob) so every visitor
@@ -658,6 +740,30 @@ export default function VasusCalculator() {
     pushToShared(file, "elmContracts");
   };
 
+  const handleBseContractsUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = reader.result;
+      // Auto-detect format: try the real Bhavcopy layout first (header row,
+      // same columns as NSE's — gives real settlement + underlying price).
+      // If that yields nothing (e.g. this is the no-header, positional
+      // contract-specs file instead), fall back to the positional parser.
+      const withHeader = Papa.parse(text, { header: true, skipEmptyLines: true }).data;
+      let parsed = parseBhavcopy(withHeader);
+      let source = "Bhavcopy";
+      if (parsed.length === 0) {
+        const noHeader = Papa.parse(text, { header: false, skipEmptyLines: true }).data;
+        parsed = parseBseContractMaster(noHeader);
+        source = "contract specs";
+      }
+      setBseContracts(parsed);
+      setBseFileStatus(`${parsed.length} BSE contracts (${source})`);
+    };
+    reader.readAsText(file);
+  };
+
   const handleSpanUpload = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -683,9 +789,21 @@ export default function VasusCalculator() {
       skipEmptyLines: true,
       complete: (res) => {
         if (kind === "contracts") {
-          const parsed = parseMcxBhavcopy(res.data);
+          // MCX switched its Bhavcopy to the same column layout as NSE/BSE —
+          // try that parser first (real price data). Its lot-size column
+          // isn't populated in this new format (always "1"), unlike the old
+          // MCX-specific layout, which derives lot size from volume ratios.
+          // Fall back to the old parser if the new-style one finds nothing.
+          let parsed = parseBhavcopy(res.data);
+          let note = "";
+          if (parsed.length > 0) {
+            const hasRealLotSize = parsed.some((c) => c.lotSize > 1);
+            if (!hasRealLotSize) note = " — lot size not available in this file";
+          } else {
+            parsed = parseMcxBhavcopy(res.data);
+          }
           setMcxContracts(parsed);
-          setMcxFileStatus((s) => ({ ...s, contracts: `${parsed.length} contracts (Bhavcopy)` }));
+          setMcxFileStatus((s) => ({ ...s, contracts: `${parsed.length} contracts (Bhavcopy)${note}` }));
         } else if (kind === "margin") {
           const map = parseMcxMarginFile(res.data);
           setMcxMarginMap(map);
@@ -730,10 +848,32 @@ export default function VasusCalculator() {
     e.target.value = "";
   };
 
+  // Merges NSE Bhavcopy contracts with BSE-specific ones (Sensex, Bankex —
+  // not present in NSE's Bhavcopy at all). BSE contracts have no price of
+  // their own, so we backfill underlying price from the .spn file's live
+  // spot price, using it as the futures price too (a reasonable stand-in,
+  // same convention used for NSE futures already).
+  const nfoContracts = useMemo(() => {
+    if (!bseContracts.length) return contracts;
+    const underlyingPrices = spanData.underlyingPrices || {};
+    const existingKeys = new Set(contracts.map((c) => `${c.symbol}|${c.expiry}|${c.instrument}|${c.strike}|${c.optionType}`));
+    const enrichedBse = bseContracts
+      .map((c) => {
+        // Bhavcopy-format uploads already carry real price/underlyingPrice —
+        // only fall back to the .spn spot price for the simpler positional
+        // contract-specs file, which has no price data of its own.
+        const underlyingPrice = c.underlyingPrice > 0 ? c.underlyingPrice : underlyingPrices[c.symbol] || 0;
+        const price = c.price > 0 ? c.price : c.instrument === "FUT" ? underlyingPrice : 0;
+        return { ...c, underlyingPrice, price };
+      })
+      .filter((c) => !existingKeys.has(`${c.symbol}|${c.expiry}|${c.instrument}|${c.strike}|${c.optionType}`));
+    return [...contracts, ...enrichedBse];
+  }, [contracts, bseContracts, spanData.underlyingPrices]);
+
   const activeContracts = useMemo(() => {
     if (draft.market === "MCX") return mcxContracts;
-    return contracts;
-  }, [draft.market, contracts, mcxContracts]);
+    return nfoContracts;
+  }, [draft.market, nfoContracts, mcxContracts]);
   const symbols = useMemo(() => [...new Set(activeContracts.map((c) => c.symbol))].sort(), [activeContracts]);
   const expiries = useMemo(() => (!draft.symbol ? [] : [...new Set(activeContracts.filter((c) => c.symbol === draft.symbol).map((c) => c.expiry))]), [activeContracts, draft.symbol]);
   const strikes = useMemo(
@@ -745,7 +885,7 @@ export default function VasusCalculator() {
   );
 
   const matchContract = (leg) => {
-    const pool = leg.market === "MCX" ? mcxContracts : contracts;
+    const pool = leg.market === "MCX" ? mcxContracts : nfoContracts;
     return pool.find((c) => c.symbol === leg.symbol && c.expiry === leg.expiry && c.instrument === leg.instrument && (leg.instrument === "FUT" || (c.strike === leg.strike && c.optionType === leg.optionType)));
   };
 
@@ -772,11 +912,24 @@ export default function VasusCalculator() {
   const clearLegs = () => setLegs([]);
 
   const rows = useMemo(() => {
+    // MCX quotes some commodities in a pricing unit different from the lot
+    // size's natural unit — most notably gold, which is universally quoted
+    // in India as ₹ per 10 grams even though lot sizes are stated in grams
+    // (e.g. GOLDM's 100g lot = 10 pricing units, not 100). Verified this
+    // directly: without the /10 correction, GOLDM calendar-spread and
+    // single-leg margin both came out ~10x too high against a real Zerodha
+    // MCX screenshot. Only applying this to GOLD/GOLDM, which are the two
+    // variants actually checked — other gold contracts (GOLDPETAL,
+    // GOLDGUINEA, GOLDTEN, GOLDHNI, GOLDGLOBAL, GOLDPTLDEL) may have their
+    // own denomination quirks that haven't been verified the same way.
+    const mcxPricingUnits = (symbol) => (["GOLD", "GOLDM"].includes(symbol) ? 10 : 1);
+
     let built = legs.map((leg) => {
       const c = matchContract(leg);
       const lotSize = c?.lotSize || 0;
       const price = c?.price || 0;
-      const notional = price * leg.qty;
+      const pricingUnits = leg.market === "MCX" ? mcxPricingUnits(leg.symbol) : 1;
+      const notional = price * (leg.qty / pricingUnits);
       const isLongOption = leg.instrument === "OPT" && leg.side === "Buy";
 
       if (leg.market === "MCX") {
@@ -792,7 +945,11 @@ export default function VasusCalculator() {
         // MCX options: margin file doesn't cover these — use the .spn scan-risk array
         const perUnitRisk = isLongOption ? 0 : scanRisk(mcxSpanData, leg);
         const spanFound = isLongOption ? true : perUnitRisk !== null;
-        const span = isLongOption ? 0 : (perUnitRisk || 0) * leg.qty;
+        let span = isLongOption ? 0 : (perUnitRisk || 0) * (leg.qty / pricingUnits);
+        if (!isLongOption && lotSize) {
+          const somRate = mcxSpanData.somRates?.[leg.symbol] || 0;
+          span = Math.max(span, somRate * (leg.qty / lotSize));
+        }
         const premium = isLongOption ? notional : 0;
         const premiumReceivable = leg.instrument === "OPT" && leg.side === "Sell" ? notional : 0;
         return { ...leg, found: !!c, spanFound, lotSize, price, span, exposure: 0, premium, premiumReceivable, spreadPair: false, total: span + premium };
@@ -816,6 +973,31 @@ export default function VasusCalculator() {
       const premium = isLongOption ? notional : 0;
       const premiumReceivable = leg.instrument === "OPT" && leg.side === "Sell" ? notional : 0;
       return { ...leg, found: !!c, spanFound, lotSize, price, span, exposure, premium, premiumReceivable, spreadPair: false, total: span + exposure + premium };
+    });
+
+    // MCX calendar spread: MCX futures margin is percentage-based (from the
+    // Margin Detail Report), not scan-risk-array-based, so it can't go
+    // through the NFO/BFO combo logic below. Same-symbol, opposite-side,
+    // equal-quantity, adjacent-month futures pairs get MCX's own per-unit
+    // spread charge (from the .spn file's tier-based rates) in place of
+    // their independent percentage-based span.
+    const mcxFutBySymbol = {};
+    built.forEach((r, idx) => { if (r.market === "MCX" && r.instrument === "FUT") (mcxFutBySymbol[r.symbol] ||= []).push(idx); });
+    Object.values(mcxFutBySymbol).forEach((idxs) => {
+      const used = new Set();
+      idxs.forEach((i) => {
+        if (used.has(i) || built[i].side !== "Buy") return;
+        const j = idxs.find((jj) => !used.has(jj) && jj !== i && built[jj].side === "Sell" && built[jj].expiry !== built[i].expiry && built[jj].qty === built[i].qty);
+        if (j === undefined) return;
+        const legA = built[i], legB = built[j];
+        const rate = getSpreadRate(mcxSpanData, legA.symbol, legA.expiry, legB.expiry);
+        if (rate === undefined) return; // non-adjacent months, or no matching tier rate found — leave as independent margin
+        const matchedQty = legA.qty / mcxPricingUnits(legA.symbol);
+        const spreadCharge = rate * matchedQty;
+        built[i] = { ...legA, span: spreadCharge / 2, calendarSpread: true, total: spreadCharge / 2 + legA.exposure };
+        built[j] = { ...legB, span: spreadCharge / 2, calendarSpread: true, total: spreadCharge / 2 + legB.exposure };
+        used.add(i); used.add(j);
+      });
     });
 
     const grossIndependent = built.reduce((s, r) => s + r.span + r.exposure, 0);
@@ -873,6 +1055,52 @@ export default function VasusCalculator() {
           portfolioScanRisk: netScanRisk,
           calendarCharge,
         };
+      });
+    });
+
+    // MCX same-expiry option combo netting (straddles/strangles/etc.) —
+    // same combined-array idea as NFO/BFO above, but scoped to one expiry
+    // only (no cross-expiry delta-matching validated for MCX), no calendar
+    // charge or Net Option Value component (unconfirmed for MCX options —
+    // that's only built for MCX futures spreads, above), and applies the
+    // same gold pricing-unit correction used elsewhere. Checked against a
+    // real GOLDM options combo from a live broker: combined span landed
+    // within ~16% of the real figure — same ballpark as ordinary day-to-
+    // day data differences seen elsewhere in this build.
+    const mcxComboGroups = {};
+    built.forEach((r, idx) => {
+      if (r.market !== "MCX" || r.instrument !== "OPT") return;
+      const key = `MCX:${r.symbol}:${r.expiry}`;
+      (mcxComboGroups[key] ||= []).push(idx);
+    });
+    Object.entries(mcxComboGroups).forEach(([key, idxs]) => {
+      if (idxs.length < 2) return;
+      const legsInGroup = idxs.map((idx) => built[idx]);
+      const hasMarginNeed = legsInGroup.some((r) => r.side === "Sell");
+      if (!hasMarginNeed) return;
+
+      const units = mcxPricingUnits(legsInGroup[0].symbol);
+      const combined = new Array(16).fill(0);
+      let allFound = true;
+      idxs.forEach((idx) => {
+        const r = built[idx];
+        const arr = getArray(mcxSpanData, r);
+        if (!arr) { allFound = false; return; }
+        const signedQty = (r.side === "Buy" ? r.qty : -r.qty) / units;
+        for (let i = 0; i < 16; i++) combined[i] += signedQty * arr[i];
+      });
+      if (!allFound) return;
+
+      // Short Option Minimum floor — verified non-zero for MCX gold family
+      // (unlike NIFTY/BANKNIFTY/RELIANCE, which all showed 0). Doesn't move
+      // this particular example since the netted scan risk is already well
+      // above the floor, but matters when netting brings scan risk very low.
+      const somRate = mcxSpanData.somRates?.[legsInGroup[0].symbol] || 0;
+      const shortOptionLots = legsInGroup.reduce((s, r) => (r.side === "Sell" && r.lotSize ? s + r.qty / r.lotSize : s), 0);
+      comboGroupSpan[key] = Math.max(0, Math.max(...combined), somRate * shortOptionLots);
+      idxs.forEach((idx) => {
+        legComboKey[idx] = key;
+        built[idx] = { ...built[idx], comboGroup: true };
       });
     });
 
@@ -935,11 +1163,11 @@ export default function VasusCalculator() {
     const underlyingSummary = underlyingOrder.map((sym) => ({ ...byUnderlying[sym], total: byUnderlying[sym].span + byUnderlying[sym].exposure }));
 
     return { grouped, spanTotal, exposureTotal, marginBenefit, premiumTotal, premiumReceivableTotal, net, underlyingSummary };
-  }, [legs, contracts, spanData, elmMap, elmContractMap, mcxContracts, mcxSpanData, mcxMarginMap]);
+  }, [legs, contracts, bseContracts, spanData, elmMap, elmContractMap, mcxContracts, mcxSpanData, mcxMarginMap]);
 
   const fmt = (n) => "₹" + Math.round(n || 0).toLocaleString("en-IN");
-  const ready = draft.market === "MCX" ? mcxContracts.length > 0 : contracts.length > 0;
-  const anyReady = contracts.length > 0 || mcxContracts.length > 0;
+  const ready = draft.market === "MCX" ? mcxContracts.length > 0 : nfoContracts.length > 0;
+  const anyReady = nfoContracts.length > 0 || mcxContracts.length > 0;
 
   // ---------------- Uploader page ----------------
   if (view === "uploader") {
@@ -965,7 +1193,7 @@ export default function VasusCalculator() {
 
         <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600, color: "var(--text-heading)", marginBottom: 4 }}>NSE F&O</div>
         <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 12px" }}>This data also covers BFO (Sensex, Bankex) — the same symbol list shows under either NFO or BFO, so pick whichever label you want the position tagged with.</p>
-        <div style={{ width: "100%", margin: "0 0 26px", display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }} className="vc-grid4">
+        <div style={{ width: "100%", margin: "0 0 26px", display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14 }} className="vc-grid4">
           <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
             <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>Bhavcopy (contract master)</div>
             <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>NSE F&O Bhavcopy CSV — symbol, expiry, strike, lot size, settlement price.</p>
@@ -1017,6 +1245,16 @@ export default function VasusCalculator() {
             {sharedSyncStatus.elmContracts === "syncing" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>Syncing to shared storage…</div>}
             {sharedSyncStatus.elmContracts === "synced" && <div style={{ fontSize: 11, color: "var(--green)", marginTop: 4 }}>✓ Visible to all visitors</div>}
             {sharedSyncStatus.elmContracts === "error" && <div style={{ fontSize: 11, color: "var(--red)", marginTop: 4 }}>Shared sync failed — only saved locally</div>}
+          </div>
+
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 16 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text-heading)", marginBottom: 8 }}>BSE contract specs (BFO)</div>
+            <p style={{ fontSize: 12, color: "var(--muted2)", margin: "0 0 10px" }}>Sensex/Bankex — NSE's Bhavcopy doesn't include these since they trade on BSE. Accepts either a real BSE Bhavcopy (same column layout as NSE's — best, has real prices) or the positional contract-specs file (lot sizes only, underlying price filled in from the SPAN file above). Auto-detected.</p>
+            <label style={fileBtnStyle}>
+              <UploadCloud size={15} /><span>{bseFileStatus ? "Replace file" : "Upload BSE contract CSV"}</span>
+              <input ref={inputs.bseContracts} type="file" accept=".csv" onChange={handleBseContractsUpload} style={{ display: "none" }} />
+            </label>
+            {bseFileStatus && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {bseFileStatus} loaded</div>}
           </div>
         </div>
 
