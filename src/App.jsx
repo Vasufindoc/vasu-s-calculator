@@ -588,7 +588,7 @@ export default function VasusCalculator() {
   const [csvError, setCsvError] = useState("");
   const [restored, setRestored] = useState(false);
   const [sharedLoading, setSharedLoading] = useState(false);
-  const [sharedSyncStatus, setSharedSyncStatus] = useState({ contracts: null, span: null, elm: null, elmContracts: null });
+  const [sharedSyncStatus, setSharedSyncStatus] = useState({ contracts: null, span: null, elm: null, elmContracts: null, bseContracts: null });
   const inputs = {
     contracts: useRef(), span: useRef(), elm: useRef(), elmContracts: useRef(), positions: useRef(), bseContracts: useRef(),
     mcxContracts: useRef(), mcxSpan: useRef(), mcxMargin: useRef(),
@@ -659,6 +659,19 @@ export default function VasusCalculator() {
           const map = parseElmContracts(rows);
           setElmContractMap(map);
           setFileStatus((s) => ({ ...s, elmContracts: `${Object.keys(map).length} contracts (shared)` }));
+        }
+        if (data.bseContracts?.url) {
+          const text = await (await fetch(data.bseContracts.url)).text();
+          const withHeader = Papa.parse(text, { header: true, skipEmptyLines: true }).data;
+          let parsed = parseBhavcopy(withHeader);
+          let source = "Bhavcopy";
+          if (parsed.length === 0) {
+            const noHeader = Papa.parse(text, { header: false, skipEmptyLines: true }).data;
+            parsed = parseBseContractMaster(noHeader);
+            source = "contract specs";
+          }
+          setBseContracts(parsed);
+          setBseFileStatus(`${parsed.length} BSE contracts (${source}, shared)`);
         }
       } catch (e) {
         console.warn("Could not load shared data", e);
@@ -762,6 +775,7 @@ export default function VasusCalculator() {
       setBseFileStatus(`${parsed.length} BSE contracts (${source})`);
     };
     reader.readAsText(file);
+    pushToShared(file, "bseContracts");
   };
 
   const handleSpanUpload = (e) => {
@@ -1255,6 +1269,9 @@ export default function VasusCalculator() {
               <input ref={inputs.bseContracts} type="file" accept=".csv" onChange={handleBseContractsUpload} style={{ display: "none" }} />
             </label>
             {bseFileStatus && <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "var(--green)", marginTop: 8 }}><CheckCircle2 size={12} /> {bseFileStatus} loaded</div>}
+            {sharedSyncStatus.bseContracts === "syncing" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>Syncing to shared storage…</div>}
+            {sharedSyncStatus.bseContracts === "synced" && <div style={{ fontSize: 11, color: "var(--green)", marginTop: 4 }}>✓ Visible to all visitors</div>}
+            {sharedSyncStatus.bseContracts === "error" && <div style={{ fontSize: 11, color: "var(--red)", marginTop: 4 }}>Shared sync failed — only saved locally</div>}
           </div>
         </div>
 
