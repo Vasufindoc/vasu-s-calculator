@@ -884,10 +884,22 @@ export default function VasusCalculator() {
     return [...contracts, ...enrichedBse];
   }, [contracts, bseContracts, spanData.underlyingPrices]);
 
+  // BSE-only pool (Sensex/Bankex etc.), unfiltered, so BFO shows only BSE expiries
+  const bsePool = useMemo(() => {
+    if (!bseContracts.length) return contracts;
+    const underlyingPrices = spanData.underlyingPrices || {};
+    return bseContracts.map((c) => {
+      const underlyingPrice = c.underlyingPrice > 0 ? c.underlyingPrice : underlyingPrices[c.symbol] || 0;
+      const price = c.price > 0 ? c.price : c.instrument === "FUT" ? underlyingPrice : 0;
+      return { ...c, underlyingPrice, price };
+    });
+  }, [contracts, bseContracts, spanData.underlyingPrices]);
+
   const activeContracts = useMemo(() => {
     if (draft.market === "MCX") return mcxContracts;
-    return nfoContracts;
-  }, [draft.market, nfoContracts, mcxContracts]);
+    if (draft.market === "BFO") return bsePool;
+    return contracts; // NFO: NSE contracts only
+  }, [draft.market, contracts, bsePool, mcxContracts]);
   const symbols = useMemo(() => [...new Set(activeContracts.map((c) => c.symbol))].sort(), [activeContracts]);
   const expiries = useMemo(() => (!draft.symbol ? [] : [...new Set(activeContracts.filter((c) => c.symbol === draft.symbol).map((c) => c.expiry))]), [activeContracts, draft.symbol]);
   const strikes = useMemo(
@@ -899,18 +911,27 @@ export default function VasusCalculator() {
   );
 
   const matchContract = (leg) => {
-    const pool = leg.market === "MCX" ? mcxContracts : nfoContracts;
-    return pool.find((c) => c.symbol === leg.symbol && c.expiry === leg.expiry && c.instrument === leg.instrument && (leg.instrument === "FUT" || (c.strike === leg.strike && c.optionType === leg.optionType)));
+    const pool = leg.market === "MCX" ? mcxContracts : leg.market === "BFO" ? bsePool : contracts;
+    const find = (arr) => arr.find((c) => c.symbol === leg.symbol && c.expiry === leg.expiry && c.instrument === leg.instrument && (leg.instrument === "FUT" || (c.strike === leg.strike && c.optionType === leg.optionType)));
+    // fall back to the merged NSE+BSE pool so older saved legs still resolve
+    return find(pool) || (leg.market === "MCX" ? undefined : find(nfoContracts));
   };
 
   const draftContract = draft.instrument === "FUT" || draft.strike ? matchContract(draft) : null;
   const draftLotSize = draftContract?.lotSize || 0;
 
-  // once a contract resolves and qty hasn't been touched yet, default to one lot
+  // last qty used per scrip, so the next expiry/strike of the same scrip
+  // defaults to the same qty instead of resetting
+  const lastQtyRef = useRef({});
+
+  // once a contract resolves and qty is empty, default to the last qty used
+  // for this scrip, else one lot
   useEffect(() => {
-    if (draftLotSize && !draft.qty) setDraft((d) => ({ ...d, qty: draftLotSize }));
+    if (!draftLotSize || draft.qty) return;
+    const last = lastQtyRef.current[`${draft.market}:${draft.symbol}`];
+    setDraft((d) => ({ ...d, qty: last || draftLotSize }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draftLotSize]);
+  }, [draftLotSize, draft.symbol, draft.expiry, draft.strike]);
 
   const addLeg = () => {
     if (!draft.symbol || !draft.expiry) return;
@@ -920,7 +941,8 @@ export default function VasusCalculator() {
     // keep market/symbol/expiry/instrument/type/side so adding several legs
     // of the same kind in a row doesn't require reselecting every field —
     // only strike and qty reset, since those usually change per leg
-    setDraft((d) => ({ ...d, strike: "", qty: 0 }));
+    if (qty > 0) lastQtyRef.current[`${draft.market}:${draft.symbol}`] = qty;
+    setDraft((d) => ({ ...d, strike: "", qty: qty > 0 ? qty : 0 }));
   };
   const removeLeg = (id) => setLegs((l) => l.filter((x) => x.id !== id));
   const clearLegs = () => setLegs([]);
@@ -1218,7 +1240,7 @@ export default function VasusCalculator() {
   }, [legs, contracts, bseContracts, spanData, elmMap, elmContractMap, mcxContracts, mcxSpanData, mcxMarginMap]);
 
   const fmt = (n) => "₹" + Math.round(n || 0).toLocaleString("en-IN");
-  const ready = draft.market === "MCX" ? mcxContracts.length > 0 : nfoContracts.length > 0;
+  const ready = draft.market === "MCX" ? mcxContracts.length > 0 : draft.market === "BFO" ? bsePool.length > 0 : contracts.length > 0;
   const anyReady = nfoContracts.length > 0 || mcxContracts.length > 0;
 
   // ---------------- Uploader page ----------------
@@ -1434,7 +1456,7 @@ export default function VasusCalculator() {
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
             <div>
               <div style={{ fontSize: 11, color: "var(--muted2)", marginBottom: 4 }}>Symbol</div>
-              <select disabled={!ready} value={draft.symbol} onChange={(e) => setDraft((d) => ({ ...d, symbol: e.target.value, expiry: "", strike: "" }))} style={selStyle}>
+              <select disabled={!ready} value={draft.symbol} onChange={(e) => setDraft((d) => ({ ...d, symbol: e.target.value, expiry: "", strike: "", qty: 0 }))} style={selStyle}>
                 <option value="">Select</option>
                 {symbols.map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
