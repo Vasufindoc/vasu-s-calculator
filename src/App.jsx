@@ -1016,6 +1016,44 @@ export default function VasusCalculator() {
 
     const grossIndependent = built.reduce((s, r) => s + r.span + r.exposure, 0);
 
+    // NSE ELM on futures calendar spreads: the matched (spread) quantity is
+    // charged only 1/3rd of the far-month leg's ELM; the near-month leg of the
+    // spread carries no ELM. Unmatched quantity keeps full ELM.
+    {
+      const futBySym = {};
+      built.forEach((r, i) => {
+        if ((r.market === "NFO" || r.market === "BFO") && r.instrument === "FUT" && r.qty > 0) {
+          (futBySym[`${r.market}:${r.symbol}`] ||= []).push(i);
+        }
+      });
+      Object.values(futBySym).forEach((idxs) => {
+        const rem = {};
+        idxs.forEach((i) => { rem[i] = built[i].qty; });
+        const order = [...idxs].sort((a, b) => parseExpiryDate(built[a].expiry) - parseExpiryDate(built[b].expiry));
+        const matchedQty = {};
+        for (let x = 0; x < order.length; x++) {
+          for (let y = x + 1; y < order.length; y++) {
+            const a = order[x], b = order[y]; // a = near, b = far
+            if (built[a].side === built[b].side) continue;
+            const m = Math.min(rem[a], rem[b]);
+            if (m <= 0) continue;
+            rem[a] -= m; rem[b] -= m;
+            matchedQty[a] = (matchedQty[a] || 0) + m;
+            matchedQty[b] = (matchedQty[b] || 0) + m;
+            matchedQty[`far${b}`] = (matchedQty[`far${b}`] || 0) + m;
+          }
+        }
+        idxs.forEach((i) => {
+          const r = built[i];
+          if (!r.exposure || !matchedQty[i]) return;
+          const perUnit = r.exposure / r.qty;
+          const farMatched = matchedQty[`far${i}`] || 0;
+          const newExposure = perUnit * (r.qty - matchedQty[i]) + perUnit * farMatched / 3;
+          built[i] = { ...r, exposure: newExposure, total: r.span + newExposure + r.premium };
+        });
+      });
+    }
+
     // Portfolio-level SPAN for NFO. The 16 risk arrays are combined across
     // every expiry of the same underlying. Calendar-spread charge is then added
     // from the portfolio's composite delta by expiry. Net option value is
